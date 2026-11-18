@@ -299,6 +299,9 @@ def test_client_provided_history_stateless():
 def test_gemini_provider_retry_on_503_success():
     sleeps = []
     mock_client = MagicMock()
+    mock_client.models.list.return_value = [
+        types.Model(name="models/gemini-2.5-flash", supported_actions=["generateContent"])
+    ]
     # Attempt 1 raises 503; Attempt 2 succeeds
     chunk = GeminiStreamChunk(text="Success on retry")
     err_503 = APIError(503, {"error": {"code": 503, "message": "The model is overloaded.", "status": "UNAVAILABLE"}})
@@ -337,6 +340,9 @@ def test_gemini_provider_non_retryable_errors_fail_immediately():
     for status_code, status_str in [(401, "UNAUTHENTICATED"), (403, "PERMISSION_DENIED"), (404, "NOT_FOUND"), (429, "RESOURCE_EXHAUSTED")]:
         sleeps = []
         mock_client = MagicMock()
+        mock_client.models.list.return_value = [
+            types.Model(name="models/gemini-2.5-flash", supported_actions=["generateContent"])
+        ]
         err = APIError(status_code, {"error": {"code": status_code, "message": "Non-retryable", "status": status_str}})
         mock_client.models.generate_content_stream.side_effect = err
 
@@ -373,7 +379,7 @@ def test_gemini_provider_model_fallback_on_exhausted_retries():
     def mock_generate_stream(*args, **kwargs):
         m = kwargs.get("model")
         calls_by_model.append(m)
-        if m == "gemini-2.5-flash":
+        if m == "models/gemini-2.5-flash":
             raise APIError(503, {"error": {"code": 503, "message": "High server demand", "status": "UNAVAILABLE"}})
         return iter([GeminiStreamChunk(text="Fallback model answered")])
 
@@ -396,10 +402,118 @@ def test_gemini_provider_model_fallback_on_exhausted_retries():
     assert len(chunks) == 1
     assert chunks[0].text == "Fallback model answered"
     # Primary model called 3 times, fallback model called once
-    assert calls_by_model.count("gemini-2.5-flash") == 3
-    assert calls_by_model.count("gemini-2.0-flash") == 1
+    assert calls_by_model.count("models/gemini-2.5-flash") == 3
+    assert calls_by_model.count("models/gemini-2.0-flash") == 1
     # Invented fake model was never confirmed, so it was never called
     assert "invented-fake-model" not in calls_by_model
+
+def test_gemini_provider_503_switches_to_verified_priority_fallback():
+    """After the primary retry budget is exhausted, the next verified model runs."""
+    mock_client = MagicMock()
+    mock_client.models.list.return_value = [
+        types.Model(name="models/gemini-3.7-flash", supported_actions=["generateContent"]),
+        types.Model(name="models/gemini-3.6-flash", supported_actions=["generateContent"]),
+        # Listed but not generation-capable: must never be called.
+        types.Model(name="models/gemini-3.5-flash-lite", supported_actions=["countTokens"]),
+    ]
+    calls = []
+    overloaded = APIError(503, {"error": {"code": 503, "message": "High demand", "status": "UNAVAILABLE"}})
+
+    def generate_stream(*args, **kwargs):
+        calls.append(kwargs["model"])
+        if kwargs["model"] == "models/gemini-3.7-flash":
+            raise overloaded
+        return iter([GeminiStreamChunk(text="fallback answer")])
+
+    mock_client.models.generate_content_stream.side_effect = generate_stream
+    provider = GeminiProvider(
+        api_key="test_key",
+        model="gemini-3.7-flash",
+        fallback_models=["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash"],
+        client=mock_client,
+        max_attempts=2,
+        sleep_func=lambda _: None,
+    )
+
+    chunks = list(provider.stream_chat(history=[{"role": "user", "content": "ping"}], system_instruction="sys"))
+    assert [chunk.text for chunk in chunks] == ["fallback answer"]
+    assert calls == ["models/gemini-3.7-flash", "models/gemini-3.7-flash", "models/gemini-3.6-flash"]
+    assert chunks[0].model == "models/gemini-3.6-flash"
+
+def test_tool_executes_once_when_provider_falls_back_before_function_call():
+    """Provider retries happen before Agent sees a call, so side effects stay single-shot."""
+    mock_client = MagicMock()
+    mock_client.models.list.return_value = [
+        types.Model(name="models/gemini-3.7-flash", supported_actions=["generateContent"]),
+        types.Model(name="models/gemini-3.6-flash", supported_actions=["generateContent"]),
+    ]
+    overloaded = APIError(503, {"error": {"code": 503, "message": "High demand", "status": "UNAVAILABLE"}})
+    calls = []
+
+    def generate_stream(*args, **kwargs):
+        model = kwargs["model"]
+        calls.append(model)
+        # The first agent round falls back, then requests a tool. The second
+        # agent round has tool results and the primary is healthy again.
+        if len(calls) <= 2 and model == "models/gemini-3.7-flash":
+            raise overloaded
+        if len(calls) == 3:
+            return iter([GeminiStreamChunk(tool_calls=[{"name": "write_once", "arguments": {}}])])
+        return iter([GeminiStreamChunk(text="Completed once.")])
+
+    mock_client.models.generate_content_stream.side_effect = generate_stream
+    provider = GeminiProvider(
+        api_key="test_key",
+        model="gemini-3.7-flash",
+        fallback_models=["gemini-3.6-flash"],
+        client=mock_client,
+        max_attempts=2,
+        sleep_func=lambda _: None,
+    )
+    registry = ToolRegistry()
+    executions = []
+    registry.register(
+        {"type": "function", "function": {"name": "write_once", "description": "one side effect"}},
+        lambda _: executions.append("called") or {"ok": True, "summary": "done"},
+    )
+
+    events = list(Agent(provider, registry, "gemini-3.7-flash").stream_respond([], "search the web"))
+    assert executions == ["called"]
+    assert events[-1]["answer"] == "Completed once."
+
+def test_gemini_provider_all_verified_models_503_raises_after_one_chain_pass():
+    mock_client = MagicMock()
+    mock_client.models.list.return_value = [
+        types.Model(name="models/gemini-3.7-flash", supported_actions=["generateContent"]),
+        types.Model(name="models/gemini-3.6-flash", supported_actions=["generateContent"]),
+    ]
+    overloaded = APIError(503, {"error": {"code": 503, "message": "High demand", "status": "UNAVAILABLE"}})
+    mock_client.models.generate_content_stream.side_effect = overloaded
+    provider = GeminiProvider(
+        api_key="test_key",
+        model="gemini-3.7-flash",
+        fallback_models=["gemini-3.6-flash"],
+        client=mock_client,
+        max_attempts=2,
+        sleep_func=lambda _: None,
+    )
+
+    with pytest.raises(APIError):
+        list(provider.stream_chat(history=[{"role": "user", "content": "ping"}], system_instruction="sys"))
+    assert mock_client.models.generate_content_stream.call_count == 4
+
+def test_gemini_provider_skips_unverified_models():
+    mock_client = MagicMock()
+    mock_client.models.list.return_value = [
+        types.Model(name="models/gemini-3.6-flash", supported_actions=["generateContent"]),
+    ]
+    provider = GeminiProvider(
+        api_key="test_key",
+        model="gemini-3.7-flash",
+        fallback_models=["gemini-3.6-flash", "invented-fake-model"],
+        client=mock_client,
+    )
+    assert provider.get_verified_model_chain("gemini-3.7-flash") == ["models/gemini-3.6-flash"]
 
 def test_gemini_provider_sanitizes_credentials_in_logs():
     secret_key = "AIzaSyTestSecretKey_123456789"
@@ -411,6 +525,9 @@ def test_gemini_provider_sanitizes_credentials_in_logs():
 
 def test_gemini_provider_timeout_budget_terminates_cleanly():
     mock_client = MagicMock()
+    mock_client.models.list.return_value = [
+        types.Model(name="models/gemini-3.7-flash", supported_actions=["generateContent"])
+    ]
     err_503 = APIError(503, {"error": {"code": 503, "message": "Overloaded", "status": "UNAVAILABLE"}})
     mock_client.models.generate_content_stream.side_effect = err_503
 

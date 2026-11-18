@@ -13,9 +13,19 @@ logger = logging.getLogger(__name__)
 
 class GeminiStreamChunk:
     """Standardized streaming chunk yielded by GeminiProvider."""
-    def __init__(self, text: str | None = None, tool_calls: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        text: str | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+    ):
         self.text = text
         self.tool_calls = tool_calls or []
+        self.model = model
+
+
+class NoVerifiedModelError(RuntimeError):
+    """Raised when the Gemini SDK cannot verify a configured generateContent model."""
 
 class GeminiProvider:
     """Manages communication with Google Gemini API using google-genai SDK,
@@ -26,11 +36,11 @@ class GeminiProvider:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.7-flash",
         fallback_models: list[str] | None = None,
         client: Any = None,
-        max_attempts: int = 3,
-        backoff_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
+        max_attempts: int = 2,
+        backoff_delays: tuple[float, ...] = (1.0, 2.0),
         request_timeout_seconds: float = 260.0,
         sleep_func: Callable[[float], None] = time.sleep,
     ):
@@ -39,14 +49,21 @@ class GeminiProvider:
         self.fallback_models = (
             fallback_models
             if fallback_models is not None
-            else [m.strip() for m in os.getenv("ORBIT_FALLBACK_MODELS", "gemini-2.0-flash,gemini-1.5-flash").split(",") if m.strip()]
+            else [
+                m.strip()
+                for m in os.getenv(
+                    "ORBIT_FALLBACK_MODELS",
+                    "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.5-flash",
+                ).split(",")
+                if m.strip()
+            ]
         )
         self._client = client
         self.max_attempts = max_attempts
         self.backoff_delays = backoff_delays
         self.request_timeout_seconds = request_timeout_seconds
         self.sleep_func = sleep_func
-        self._confirmed_models: set[str] | None = None
+        self._confirmed_models: dict[str, str] | None = None
 
     @property
     def client(self) -> Any:
@@ -57,7 +74,12 @@ class GeminiProvider:
                 "GEMINI_API_KEY is not configured in backend environment variables. "
                 "Please configure GEMINI_API_KEY in your hosting dashboard or .env file."
             )
-        self._client = genai.Client(api_key=self.api_key)
+        # Bound discovery and generation requests. The per-request timeout is
+        # reduced further in stream_chat to honour the Vercel execution budget.
+        self._client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(timeout=20_000),
+        )
         return self._client
 
     def _sanitize(self, message: str) -> str:
@@ -117,46 +139,72 @@ class GeminiProvider:
 
         return False
 
-    def get_confirmed_models(self) -> set[str]:
-        """Fetch models confirmed available for this API key via Gemini API."""
+    @staticmethod
+    def _model_id(value: str) -> str:
+        return value.removeprefix("models/").strip().lower()
+
+    @staticmethod
+    def _supports_generate_content(model: Any) -> bool:
+        """Accept only models whose SDK metadata explicitly advertises generation."""
+        actions = getattr(model, "supported_actions", None)
+        if actions is None:
+            actions = getattr(model, "supported_generation_methods", None)
+        if not actions:
+            return False
+        return any("generatecontent" in str(action).replace("_", "").lower() for action in actions)
+
+    def get_confirmed_models(self) -> dict[str, str]:
+        """Return SDK-discovered, generateContent-capable models keyed by short ID.
+
+        The listed resource name is retained as the invocation value. This makes
+        model discovery an allow-list rather than treating configured IDs as valid.
+        """
         if self._confirmed_models is not None:
             return self._confirmed_models
         try:
-            confirmed: set[str] = set()
+            confirmed: dict[str, str] = {}
             if hasattr(self.client, "models") and hasattr(self.client.models, "list"):
                 pager = self.client.models.list()
                 for m in pager:
                     name = getattr(m, "name", None)
-                    if not name or not isinstance(name, str):
+                    if not name or not isinstance(name, str) or not self._supports_generate_content(m):
                         continue
-                    actions = getattr(m, "supported_actions", None) or []
-                    if actions and not any("generatecontent" in a.lower() for a in actions):
-                        continue
-                    clean_name = name.removeprefix("models/").strip().lower()
-                    confirmed.add(clean_name)
-                    confirmed.add(name.strip().lower())
+                    confirmed[self._model_id(name)] = name.strip()
             self._confirmed_models = confirmed
+            logger.info("Gemini SDK discovered %d generateContent-capable models.", len(confirmed))
             return self._confirmed_models
         except Exception as exc:
             safe_msg = self._sanitize(str(exc))
             logger.warning(f"Could not retrieve confirmed models from Gemini API: {safe_msg}")
-            self._confirmed_models = set()
-            return self._confirmed_models
+            # Do not cache discovery failures in a warm serverless instance.
+            # The next user request gets a fresh chance to obtain the inventory.
+            return {}
 
-    def get_eligible_fallback_models(self, primary_model: str) -> list[str]:
-        """Return fallback models confirmed available for this API key, excluding primary."""
+    def get_verified_model_chain(self, primary_model: str) -> list[str]:
+        """Build the configured priority chain from SDK-confirmed model resources only."""
+        if not self.api_key and self._client is None:
+            raise ValueError(
+                "GEMINI_API_KEY is not configured in backend environment variables. "
+                "Please configure GEMINI_API_KEY in your hosting dashboard or .env file."
+            )
         confirmed = self.get_confirmed_models()
-        eligible: list[str] = []
-        clean_primary = primary_model.removeprefix("models/").strip().lower()
-        for cand in self.fallback_models:
-            cand_clean = cand.removeprefix("models/").strip().lower()
-            if cand_clean == clean_primary:
-                continue
-            # Only use fallback models confirmed available through the Gemini API for this key
-            if not confirmed or (cand_clean in confirmed or cand.strip().lower() in confirmed):
-                if cand not in eligible:
-                    eligible.append(cand)
-        return eligible
+        if not confirmed:
+            raise NoVerifiedModelError(
+                "No Gemini models with generateContent support could be verified for this API key."
+            )
+
+        chain: list[str] = []
+        for candidate in [primary_model, *self.fallback_models]:
+            verified = confirmed.get(self._model_id(candidate))
+            if verified and verified not in chain:
+                chain.append(verified)
+            elif not verified:
+                logger.info("Skipping unavailable or unsupported Gemini model '%s'.", candidate)
+        if not chain:
+            raise NoVerifiedModelError(
+                "None of the configured Gemini models support generateContent for this API key."
+            )
+        return chain
 
     def convert_tool_definitions(self, tool_definitions: Sequence[dict[str, Any]]) -> list[types.Tool]:
         """Convert tool definitions to Gemini types.Tool."""
@@ -238,9 +286,11 @@ class GeminiProvider:
                 i += 1
         return contents
 
-    def _parse_raw_chunk(self, chunk: Any) -> GeminiStreamChunk:
+    def _parse_raw_chunk(self, chunk: Any, model: str | None = None) -> GeminiStreamChunk:
         """Parse raw SDK chunk into standardized GeminiStreamChunk."""
         if isinstance(chunk, GeminiStreamChunk):
+            if chunk.model is None:
+                chunk.model = model
             return chunk
         chunk_text = None
         tool_calls = []
@@ -257,7 +307,7 @@ class GeminiProvider:
                     })
             if text_pieces:
                 chunk_text = "".join(text_pieces)
-        return GeminiStreamChunk(text=chunk_text, tool_calls=tool_calls)
+        return GeminiStreamChunk(text=chunk_text, tool_calls=tool_calls, model=model)
 
     def stream_chat(
         self,
@@ -287,12 +337,8 @@ class GeminiProvider:
             if gemini_tools:
                 config_kwargs["tools"] = gemini_tools
 
-        models_to_try = [target_model]
-        fallbacks_added = False
-        model_idx = 0
-
-        while model_idx < len(models_to_try):
-            current_model = models_to_try[model_idx]
+        models_to_try = self.get_verified_model_chain(target_model)
+        for model_idx, current_model in enumerate(models_to_try):
 
             for attempt in range(1, self.max_attempts + 1):
                 now = time.time()
@@ -303,9 +349,14 @@ class GeminiProvider:
                     )
                     raise TimeoutError("Request time budget exceeded before completion.")
 
-                config = types.GenerateContentConfig(**config_kwargs)
+                remaining_seconds = request_deadline - now
+                config = types.GenerateContentConfig(
+                    **config_kwargs,
+                    http_options=types.HttpOptions(timeout=max(1_000, int(min(remaining_seconds, 60) * 1_000))),
+                )
 
                 try:
+                    first_raw = None
                     stream = self.client.models.generate_content_stream(
                         model=current_model,
                         contents=contents,
@@ -317,9 +368,10 @@ class GeminiProvider:
 
                     # If successful, yield chunks
                     if first_raw is not None:
-                        yield self._parse_raw_chunk(first_raw)
+                        logger.info("Gemini model '%s' succeeded.", current_model)
+                        yield self._parse_raw_chunk(first_raw, model=current_model)
                     for remaining_raw in stream_iter:
-                        yield self._parse_raw_chunk(remaining_raw)
+                        yield self._parse_raw_chunk(remaining_raw, model=current_model)
                     return  # Generation completed successfully
 
                 except Exception as exc:
@@ -332,6 +384,17 @@ class GeminiProvider:
                         logger.error(
                             f"Non-retryable Gemini error on model '{current_model}' "
                             f"(status={status_code}): {safe_msg}"
+                        )
+                        raise
+
+                    # A stream that has already reached the client cannot be safely
+                    # replayed: doing so could duplicate visible output or tool calls.
+                    # The first next() above makes all retry/fallback attempts happen
+                    # before any chunk is yielded.
+                    if "first_raw" in locals() and first_raw is not None:
+                        logger.error(
+                            "Gemini stream failed after output began on model '%s'; not retrying.",
+                            current_model,
                         )
                         raise
 
@@ -363,14 +426,6 @@ class GeminiProvider:
                             f"(status={status_code}): {safe_msg}"
                         )
 
-                        # Check for confirmed fallback models if not yet added
-                        if not fallbacks_added:
-                            fallbacks_added = True
-                            eligible_fallbacks = self.get_eligible_fallback_models(target_model)
-                            for fb in eligible_fallbacks:
-                                if fb not in models_to_try:
-                                    models_to_try.append(fb)
-
                         # If another model is available, switch to it
                         if model_idx + 1 < len(models_to_try):
                             next_model = models_to_try[model_idx + 1]
@@ -386,4 +441,3 @@ class GeminiProvider:
                             )
                             raise
 
-            model_idx += 1

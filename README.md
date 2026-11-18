@@ -9,7 +9,7 @@ A modern, cloud-ready personal AI agent with a responsive React chat UI, Python 
 - **Hosting**: Single-project, single-domain deployment on **Vercel**.
 - **Frontend**: React + TypeScript + Vite, served from `frontend/dist`.
 - **Backend API**: Python + Flask running as Vercel Serverless Functions via [`api/index.py`](file:///Users/devesh/Developer/orbit/api/index.py) with Server-Sent Events (SSE) streaming and up to 300s execution duration.
-- **AI Engine**: Google Gemini API via official `google-genai` SDK (`gemini-2.5-flash`). Zero dependencies on local Ollama or GPU hardware.
+- **AI Engine**: Google Gemini API via the official `google-genai` SDK. On each cold start, ORBIT discovers models for the deployed key and uses only those that explicitly support `generateContent`.
 - **Routing & Networking**: Single domain (e.g. `https://orbit.vercel.app`) with automatic same-origin routing for `/api/*` and SPA fallback for `/*`. No cross-origin CORS configuration required in production.
 - **Security & Protection**:
   - `GEMINI_API_KEY` is loaded strictly by the serverless Python environment and is never exposed in browser or client code.
@@ -91,3 +91,18 @@ Deploying ORBIT requires just one project on Vercel:
 5. Click **Deploy**.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for full dashboard settings and details.
+
+## Gemini overload fallback
+
+ORBIT prefers `gemini-3.7-flash`, then `gemini-3.6-flash`,
+`gemini-3.5-flash-lite`, and `gemini-3.5-flash`. These are preferences, not
+blind API calls: `client.models.list()` filters the chain to models whose SDK
+metadata includes `generateContent`. Models absent from that inventory, or
+without that action, are skipped and never invoked.
+
+For transient server failures (500, 502, 503, 504, `UNAVAILABLE`), each
+verified model receives the bounded retry budget. After that budget is used,
+ORBIT immediately moves to the next verified model. It does not treat 400,
+401, 403, 404, or 429 as overload retries. Each streamed answer includes the
+model that produced it in the UI. The total request budget is capped at 260
+seconds, leaving margin below Vercel's 300-second limit.

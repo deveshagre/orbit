@@ -4,7 +4,7 @@ import orbitLogo from '../logo.png'
 
 type Activity = { tool: string; ok: boolean; summary: string }
 type Timing = { mode: 'simple' | 'tools'; total_ms: number; model_ms: number }
-type Message = { role: 'user' | 'assistant'; content: string; activity?: Activity[]; timing?: Timing; error?: boolean }
+type Message = { role: 'user' | 'assistant'; content: string; activity?: Activity[]; timing?: Timing; model?: string; error?: boolean }
 type Conversation = { id: string; title: string; messages: Message[] }
 const welcome = 'What would you like to explore today?'
 
@@ -102,7 +102,11 @@ export default function App() {
           }
           return {...c, messages}
         })
-        if (event.type === 'done') patchAssistant({content:event.answer || streamedContent, activity:event.tool_activity || [], timing:event.timing})
+        if (event.type === 'model' && event.model) setModelName(event.model)
+        if (event.type === 'done') {
+          if (event.model) setModelName(event.model)
+          patchAssistant({content:event.answer || streamedContent, activity:event.tool_activity || [], timing:event.timing, model:event.model})
+        }
         if (event.type === 'error') {
           let errorMsg = event.error
           if (!errorMsg || errorMsg.startsWith('Agent unavailable:')) {
@@ -204,7 +208,7 @@ export default function App() {
                     <div className="thinking"><LoaderCircle size={15} className="spin"/><span>ORBIT is thinking</span></div>
                   ) : null}
                   {m.role==='assistant'&&m.timing ? (
-                    <div className="message-latency">{(m.timing.total_ms/1000).toFixed(1)}s · {m.timing.mode==='simple'?'direct response':'tools'}</div>
+                    <div className="message-latency">{(m.timing.total_ms/1000).toFixed(1)}s · {m.timing.mode==='simple'?'direct response':'tools'}{m.model ? ` · ${m.model}` : ''}</div>
                   ) : null}
                 </div>
               </div>

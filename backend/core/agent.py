@@ -82,6 +82,7 @@ class Agent:
         activities: list[dict[str, Any]] = []
         model_ms = 0.0
         first_token_ms = None
+        model_used: str | None = None
         yield {"type": "start", "mode": mode}
 
         for round_index in range(self.max_rounds if tool_mode else 1):
@@ -103,6 +104,15 @@ class Agent:
             tool_calls: list[dict[str, Any]] = []
 
             for chunk in chunks:
+                chunk_model = getattr(chunk, "model", None)
+                if chunk_model:
+                    # The SDK lists names as models/<id>; the concise ID is what
+                    # users should see in the chat while retaining the verified
+                    # resource name internally for requests.
+                    visible_model = chunk_model.removeprefix("models/")
+                    if visible_model != model_used:
+                        model_used = visible_model
+                        yield {"type": "model", "model": model_used}
                 text = getattr(chunk, "text", None)
                 if text:
                     if first_token_ms is None:
@@ -125,6 +135,7 @@ class Agent:
                     "type": "done",
                     "answer": answer,
                     "tool_activity": activities,
+                    "model": model_used,
                     "timing": {
                         "mode": mode,
                         "total_ms": round((time.perf_counter() - started) * 1000),
@@ -141,6 +152,7 @@ class Agent:
                     "type": "done",
                     "answer": answer,
                     "tool_activity": activities,
+                    "model": model_used,
                     "timing": {
                         "mode": mode,
                         "total_ms": round((time.perf_counter() - started) * 1000),
@@ -183,6 +195,7 @@ class Agent:
                 "type": "done",
                 "answer": answer,
                 "tool_activity": activities,
+                "model": model_used,
                 "timing": {
                     "mode": mode,
                     "total_ms": round((time.perf_counter() - started) * 1000),

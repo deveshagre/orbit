@@ -6,7 +6,7 @@ type Activity = { tool: string; ok: boolean; summary: string }
 type Timing = { mode: 'simple' | 'tools'; total_ms: number; model_ms: number }
 type Message = { role: 'user' | 'assistant'; content: string; activity?: Activity[]; timing?: Timing; model?: string; error?: boolean }
 type Conversation = { id: string; title: string; messages: Message[] }
-const welcome = 'What would you like to explore today?'
+const welcome = 'What would you like to explore?'
 
 // Base API URL configurable via VITE_API_URL (empty string uses Vite dev proxy)
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
@@ -63,6 +63,8 @@ export default function App() {
       .filter(m => m.content && !m.error)
       .map(m => ({ role: m.role, content: m.content }))
 
+    let terminalEventReceived = false
+
     try {
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
@@ -104,10 +106,12 @@ export default function App() {
         })
         if (event.type === 'model' && event.model) setModelName(event.model)
         if (event.type === 'done') {
+          terminalEventReceived = true
           if (event.model) setModelName(event.model)
           patchAssistant({content:event.answer || streamedContent, activity:event.tool_activity || [], timing:event.timing, model:event.model})
         }
         if (event.type === 'error') {
+          terminalEventReceived = true
           let errorMsg = event.error
           if (!errorMsg || errorMsg.startsWith('Agent unavailable:')) {
             if (event.code === 503) errorMsg = 'Gemini is temporarily overloaded. Try again shortly.'
@@ -125,29 +129,35 @@ export default function App() {
         const parts = buffer.split('\n\n')
         buffer = parts.pop() || ''
         parts.forEach(handle)
+        if (terminalEventReceived) {
+          await reader.cancel().catch(() => {})
+          break
+        }
         if (done) break
       }
-      if (buffer.trim()) handle(buffer)
+      if (!terminalEventReceived && buffer.trim()) handle(buffer)
     } catch (err) {
-      patchAssistant({content:err instanceof Error ? err.message : 'Could not connect to ORBIT.', error:true})
+      if (!terminalEventReceived) {
+        patchAssistant({content:err instanceof Error ? err.message : 'Could not connect to ORBIT.', error:true})
+      }
     } finally {
       setBusy(false)
     }
   }
 
-  return <div className="app-shell min-h-screen">
+  return <div className="app-shell">
     <aside className={`sidebar ${menuOpen?'sidebar-open':''}`}>
       <div className="brand-row">
         <img className="sidebar-logo" src={orbitLogo} alt="ORBIT"/>
-        <button className="icon-btn mobile-close" onClick={()=>setMenuOpen(false)} aria-label="Close sidebar"><X size={18}/></button>
+        <button className="icon-btn mobile-close" onClick={()=>setMenuOpen(false)} aria-label="Close sidebar"><X size={20}/></button>
       </div>
-      <button className="new-chat" onClick={fresh}><Plus size={17}/><span>New chat</span><kbd>⌘ K</kbd></button>
-      <div className="side-label">RECENTS</div>
+      <button className="new-chat" onClick={fresh}><Plus size={17}/><span>New Chat</span><kbd>⌘ K</kbd></button>
+      <div className="side-label">Recents</div>
       <div className="conversation-list">
         {conversations.map(c=><button key={c.id} onClick={()=>{setActiveId(c.id);setMenuOpen(false)}} className={`conversation-link ${c.id===activeId?'selected':''}`}><span className="conv-dot"/>{c.title}</button>)}
       </div>
       <div className="sidebar-bottom">
-        <div className={`connection ${health}`}><span/>{health==='ready'?'API ready':health==='offline'?'API unavailable':'Connecting'}</div>
+        <div className={`connection ${health}`}><span/>{health==='ready'?'API READY':health==='offline'?'API OFFLINE':'CONNECTING...'}</div>
         <div className="local-note">
           <span className="local-icon"><Sparkles size={15}/></span>
           <div><strong>Cloud AI Agent</strong><small>Powered by Gemini API</small></div>
@@ -157,17 +167,17 @@ export default function App() {
     {menuOpen && <button className="scrim" onClick={()=>setMenuOpen(false)} aria-label="Close menu"/>}
     <main className="main-panel">
       <header className="topbar">
-        <button className="icon-btn menu-trigger" onClick={()=>setMenuOpen(true)} aria-label="Open sidebar"><Menu size={19}/></button>
-        <div className="top-title">ORBIT <span className="top-separator">/</span> <span>Cloud agent</span></div>
+        <button className="icon-btn menu-trigger" onClick={()=>setMenuOpen(true)} aria-label="Open sidebar"><Menu size={20}/></button>
+        <div className="top-title">ORBIT <span className="top-separator">/</span> <span>Cloud Agent</span></div>
         <div className="model-pill"><i/> {modelName}</div>
       </header>
       <section className={`chat-area ${active.messages.length?'has-messages':''}`}>
         {active.messages.length===0 ? (
           <div className="welcome">
             <img className="welcome-logo" src={orbitLogo} alt="ORBIT" />
-            <div className="eyebrow">CLOUD PERSONAL AGENT</div>
+            <div className="eyebrow">AI AGENT</div>
             <h1>{welcome}</h1>
-            <p>Search the live web and solve complex problems.<br/>Powered by Google Gemini in the cloud.</p>
+            <p>Search the live web, solve complex problems, and get answers instantly.<br/>Powered by Google Gemini in the cloud.</p>
             <div className="suggestions">
               {[
                 'Search the web for the latest Python release',
@@ -205,7 +215,7 @@ export default function App() {
                   {m.content ? (
                     <div className={`bubble ${m.role} ${m.error?'error':''}`}>{m.content}</div>
                   ) : m.role==='assistant'&&busy ? (
-                    <div className="thinking"><LoaderCircle size={15} className="spin"/><span>ORBIT is thinking</span></div>
+                    <div className="thinking"><LoaderCircle size={16} className="spin"/><span>ORBIT is thinking...</span></div>
                   ) : null}
                   {m.role==='assistant'&&m.timing ? (
                     <div className="message-latency">{(m.timing.total_ms/1000).toFixed(1)}s · {m.timing.mode==='simple'?'direct response':'tools'}{m.model ? ` · ${m.model}` : ''}</div>
@@ -228,9 +238,9 @@ export default function App() {
             disabled={busy}
           />
           <div className="composer-bottom">
-            <span className="input-hint">Enter to send <span>·</span> Shift + Enter for a new line</span>
+            <span className="input-hint">Enter to send <span>·</span> Shift + Enter for new line</span>
             <button type="submit" className="send-btn" disabled={!input.trim()||busy} aria-label="Send message">
-              {busy?<LoaderCircle size={17} className="spin"/>:<ArrowUp size={17}/>}
+              {busy?<LoaderCircle size={18} className="spin"/>:<ArrowUp size={18}/>}
             </button>
           </div>
         </form>

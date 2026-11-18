@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from collections import defaultdict
 from threading import Lock, RLock
@@ -24,6 +25,9 @@ from config import (
     RATE_LIMIT_PER_MINUTE,
     TEMPERATURE,
     WORKSPACE,
+    FALLBACK_MODELS,
+    MAX_RETRIES,
+    REQUEST_TIMEOUT_SECONDS,
 )
 from core.agent import Agent
 from core.gemini_provider import GeminiProvider
@@ -106,7 +110,13 @@ def create_app(agent=None, rate_limiter=None):
         registry.register(FILESYSTEM_DEFINITION, files.run)
         registry.register(APP_DEFINITION, launch_application)
 
-        provider = GeminiProvider(api_key=GEMINI_API_KEY, model=MODEL)
+        provider = GeminiProvider(
+            api_key=GEMINI_API_KEY,
+            model=MODEL,
+            fallback_models=FALLBACK_MODELS,
+            max_attempts=MAX_RETRIES,
+            request_timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+        )
         agent = Agent(
             provider=provider,
             registry=registry,
@@ -272,15 +282,28 @@ def create_app(agent=None, rate_limiter=None):
                         history.pop()
                     app.logger.exception("Agent request failed")
                     err_str = str(exc)
+                    status_code = getattr(exc, "code", None)
+                    if not isinstance(status_code, int):
+                        code_match = re.search(r'\b(503|500|504|502|429|401|403|404|400)\b', err_str)
+                        status_code = int(code_match.group(1)) if code_match else None
+
                     if "GEMINI_API_KEY" in err_str:
                         user_error = "Gemini API key is not configured. Please set GEMINI_API_KEY in backend environment variables."
-                    elif "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
-                        user_error = "Gemini API rate limit or quota exceeded. Please try again shortly."
-                    elif "API_KEY_INVALID" in err_str or "401" in err_str or "403" in err_str:
-                        user_error = "Invalid Gemini API key. Please check your GEMINI_API_KEY configuration."
+                        status_code = 401
+                    elif status_code == 503 or "503" in err_str or "UNAVAILABLE" in err_str or "overloaded" in err_str.lower():
+                        user_error = "Gemini is temporarily overloaded. Try again shortly."
+                        status_code = 503
+                    elif status_code == 429 or "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
+                        user_error = "API rate limit or quota exceeded."
+                        status_code = 429
+                    elif status_code in (401, 403) or "API_KEY_INVALID" in err_str or "401" in err_str or "403" in err_str or "PERMISSION_DENIED" in err_str or "UNAUTHENTICATED" in err_str:
+                        user_error = "API authentication or permission issue."
+                        status_code = status_code or 401
                     else:
-                        user_error = f"Agent unavailable: {exc.__class__.__name__}"
-                    error = {"type": "error", "error": user_error}
+                        user_error = "ORBIT could not complete your request. Please try again."
+                        status_code = status_code or 500
+
+                    error = {"type": "error", "error": user_error, "code": status_code}
                     yield f"data: {json.dumps(error)}\n\n"
 
         return Response(stream_with_context(events()), mimetype="text/event-stream", headers={

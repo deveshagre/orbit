@@ -8,6 +8,7 @@ from core.tool_registry import ToolRegistry
 from tools.applications import launch_application
 from tools.filesystem import WorkspaceFiles
 from google.genai import types
+from google.genai.errors import APIError
 
 class FakeProvider:
     """Mock provider simulating Gemini streaming chunks."""
@@ -292,3 +293,180 @@ def test_client_provided_history_stateless():
     assert res.status_code == 200
     passed_history = provider.calls[0]["history"]
     assert any(m["content"] == "My name is Alice" for m in passed_history)
+
+# -- 5. Reliability, Retry, Fallback & Error Handling Tests --
+
+def test_gemini_provider_retry_on_503_success():
+    sleeps = []
+    mock_client = MagicMock()
+    # Attempt 1 raises 503; Attempt 2 succeeds
+    chunk = GeminiStreamChunk(text="Success on retry")
+    err_503 = APIError(503, {"error": {"code": 503, "message": "The model is overloaded.", "status": "UNAVAILABLE"}})
+
+    attempt_count = 0
+    def mock_generate_stream(*args, **kwargs):
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            raise err_503
+        return iter([chunk])
+
+    mock_client.models.generate_content_stream.side_effect = mock_generate_stream
+
+    provider = GeminiProvider(
+        api_key="test_key",
+        model="gemini-2.5-flash",
+        client=mock_client,
+        max_attempts=3,
+        backoff_delays=(2.0, 5.0, 10.0),
+        sleep_func=lambda s: sleeps.append(s),
+    )
+
+    chunks = list(provider.stream_chat(
+        history=[{"role": "user", "content": "ping"}],
+        system_instruction="sys",
+    ))
+    assert len(chunks) == 1
+    assert chunks[0].text == "Success on retry"
+    assert attempt_count == 2
+    assert len(sleeps) == 1
+    # Bounded delay of ~2s with jitter (1.7s to 2.3s)
+    assert 1.6 <= sleeps[0] <= 2.4
+
+def test_gemini_provider_non_retryable_errors_fail_immediately():
+    for status_code, status_str in [(401, "UNAUTHENTICATED"), (403, "PERMISSION_DENIED"), (404, "NOT_FOUND"), (429, "RESOURCE_EXHAUSTED")]:
+        sleeps = []
+        mock_client = MagicMock()
+        err = APIError(status_code, {"error": {"code": status_code, "message": "Non-retryable", "status": status_str}})
+        mock_client.models.generate_content_stream.side_effect = err
+
+        provider = GeminiProvider(
+            api_key="test_key",
+            model="gemini-2.5-flash",
+            client=mock_client,
+            max_attempts=3,
+            sleep_func=lambda s: sleeps.append(s),
+        )
+
+        with pytest.raises(APIError) as exc_info:
+            list(provider.stream_chat(
+                history=[{"role": "user", "content": "ping"}],
+                system_instruction="sys",
+            ))
+        assert exc_info.value.code == status_code
+        assert len(sleeps) == 0  # Zero retries for non-retryable errors
+        assert mock_client.models.generate_content_stream.call_count == 1
+
+def test_gemini_provider_model_fallback_on_exhausted_retries():
+    sleeps = []
+    mock_client = MagicMock()
+
+    # Confirmed models via API
+    confirmed_model_objs = [
+        types.Model(name="models/gemini-2.5-flash", supported_actions=["generateContent"]),
+        types.Model(name="models/gemini-2.0-flash", supported_actions=["generateContent"]),
+    ]
+    mock_client.models.list.return_value = confirmed_model_objs
+
+    # 2.5-flash fails on all 3 attempts with 503; 2.0-flash succeeds on attempt 1
+    calls_by_model = []
+    def mock_generate_stream(*args, **kwargs):
+        m = kwargs.get("model")
+        calls_by_model.append(m)
+        if m == "gemini-2.5-flash":
+            raise APIError(503, {"error": {"code": 503, "message": "High server demand", "status": "UNAVAILABLE"}})
+        return iter([GeminiStreamChunk(text="Fallback model answered")])
+
+    mock_client.models.generate_content_stream.side_effect = mock_generate_stream
+
+    provider = GeminiProvider(
+        api_key="test_key",
+        model="gemini-2.5-flash",
+        fallback_models=["gemini-2.0-flash", "invented-fake-model"],
+        client=mock_client,
+        max_attempts=3,
+        sleep_func=lambda s: sleeps.append(s),
+    )
+
+    chunks = list(provider.stream_chat(
+        history=[{"role": "user", "content": "ping"}],
+        system_instruction="sys",
+    ))
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "Fallback model answered"
+    # Primary model called 3 times, fallback model called once
+    assert calls_by_model.count("gemini-2.5-flash") == 3
+    assert calls_by_model.count("gemini-2.0-flash") == 1
+    # Invented fake model was never confirmed, so it was never called
+    assert "invented-fake-model" not in calls_by_model
+
+def test_gemini_provider_sanitizes_credentials_in_logs():
+    secret_key = "AIzaSyTestSecretKey_123456789"
+    provider = GeminiProvider(api_key=secret_key, client=MagicMock())
+    raw_error = f"API error occurred: key={secret_key} with Bearer {secret_key}"
+    sanitized = provider._sanitize(raw_error)
+    assert secret_key not in sanitized
+    assert "[REDACTED" in sanitized
+
+def test_gemini_provider_timeout_budget_terminates_cleanly():
+    mock_client = MagicMock()
+    err_503 = APIError(503, {"error": {"code": 503, "message": "Overloaded", "status": "UNAVAILABLE"}})
+    mock_client.models.generate_content_stream.side_effect = err_503
+
+    provider = GeminiProvider(
+        api_key="test_key",
+        client=mock_client,
+        max_attempts=3,
+        request_timeout_seconds=0.001,  # immediate deadline
+        sleep_func=lambda s: None,
+    )
+
+    with pytest.raises(TimeoutError) as exc_info:
+        list(provider.stream_chat(
+            history=[{"role": "user", "content": "ping"}],
+            system_instruction="sys",
+        ))
+    assert "time budget exceeded" in str(exc_info.value).lower()
+
+def test_sse_error_event_formatting_503():
+    class FailingProvider:
+        model = "gemini-2.5-flash"
+        def stream_chat(self, **kwargs):
+            raise APIError(503, {"error": {"code": 503, "message": "The model is overloaded.", "status": "UNAVAILABLE"}})
+
+    agent = Agent(FailingProvider(), ToolRegistry(), "gemini-2.5-flash")
+    app = create_app(agent=agent)
+    client = app.test_client()
+    res = client.post("/api/chat", json={"message": "hello"})
+    assert res.status_code == 200
+    events = [json.loads(line.replace("data: ", "")) for line in res.data.decode().splitlines() if line.startswith("data: ")]
+    assert any(e.get("type") == "error" and e.get("code") == 503 and "temporarily overloaded" in e.get("error", "") for e in events)
+
+def test_sse_error_event_formatting_429():
+    class QuotaFailingProvider:
+        model = "gemini-2.5-flash"
+        def stream_chat(self, **kwargs):
+            raise APIError(429, {"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED"}})
+
+    agent = Agent(QuotaFailingProvider(), ToolRegistry(), "gemini-2.5-flash")
+    app = create_app(agent=agent)
+    client = app.test_client()
+    res = client.post("/api/chat", json={"message": "hello"})
+    assert res.status_code == 200
+    events = [json.loads(line.replace("data: ", "")) for line in res.data.decode().splitlines() if line.startswith("data: ")]
+    assert any(e.get("type") == "error" and e.get("code") == 429 and "rate limit or quota exceeded" in e.get("error", "").lower() for e in events)
+
+def test_sse_error_event_formatting_401_403():
+    class AuthFailingProvider:
+        model = "gemini-2.5-flash"
+        def stream_chat(self, **kwargs):
+            raise APIError(401, {"error": {"code": 401, "message": "API key invalid", "status": "UNAUTHENTICATED"}})
+
+    agent = Agent(AuthFailingProvider(), ToolRegistry(), "gemini-2.5-flash")
+    app = create_app(agent=agent)
+    client = app.test_client()
+    res = client.post("/api/chat", json={"message": "hello"})
+    assert res.status_code == 200
+    events = [json.loads(line.replace("data: ", "")) for line in res.data.decode().splitlines() if line.startswith("data: ")]
+    assert any(e.get("type") == "error" and e.get("code") == 401 and "authentication or permission" in e.get("error", "").lower() for e in events)

@@ -67,6 +67,9 @@ Under **Project Settings > Environment Variables** in Vercel:
 | :--- | :--- | :--- |
 | `GEMINI_API_KEY` | `AIzaSy...` | **Required**. Your Google Gemini API Key from [Google AI Studio](https://aistudio.google.com/). |
 | `ORBIT_MODEL` | `gemini-2.5-flash` | Gemini model variant (optional, defaults to `gemini-2.5-flash`). |
+| `ORBIT_FALLBACK_MODELS` | `gemini-2.0-flash,gemini-1.5-flash` | Comma-separated list of confirmed fallback models if primary model is 503 overloaded. |
+| `ORBIT_MAX_RETRIES` | `3` | Maximum retry attempts per model with bounded backoff and jitter. |
+| `ORBIT_REQUEST_TIMEOUT_SECONDS` | `260` | Deadline cap terminating requests cleanly before Vercel 300s timeout. |
 | `VITE_API_URL` | *(Leave empty)* | **Leave empty or unset**. When empty, the frontend calls `/api/*` on the same domain, eliminating CORS preflight. |
 | `ALLOWED_ORIGINS` | `*` | Optional CORS header fallback. |
 | `ORBIT_ENABLE_APP_LAUNCHER` | `false` | Disables macOS app launcher in cloud. |

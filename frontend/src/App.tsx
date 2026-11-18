@@ -72,7 +72,14 @@ export default function App() {
 
       if (!res.ok || !res.body) {
         const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || `Request failed with status ${res.status}`)
+        let msg = data.error
+        if (!msg) {
+          if (res.status === 503) msg = 'Gemini is temporarily overloaded. Try again shortly.'
+          else if (res.status === 429) msg = 'API rate limit or quota exceeded.'
+          else if (res.status === 401 || res.status === 403) msg = 'API authentication or permission issue.'
+          else msg = 'ORBIT could not complete your request. Please try again.'
+        }
+        throw new Error(msg)
       }
 
       const reader = res.body.getReader()
@@ -96,7 +103,16 @@ export default function App() {
           return {...c, messages}
         })
         if (event.type === 'done') patchAssistant({content:event.answer || streamedContent, activity:event.tool_activity || [], timing:event.timing})
-        if (event.type === 'error') patchAssistant({content:event.error || 'ORBIT could not complete the request.', error:true})
+        if (event.type === 'error') {
+          let errorMsg = event.error
+          if (!errorMsg || errorMsg.startsWith('Agent unavailable:')) {
+            if (event.code === 503) errorMsg = 'Gemini is temporarily overloaded. Try again shortly.'
+            else if (event.code === 429) errorMsg = 'API rate limit or quota exceeded.'
+            else if (event.code === 401 || event.code === 403) errorMsg = 'API authentication or permission issue.'
+            else errorMsg = 'ORBIT could not complete your request. Please try again.'
+          }
+          patchAssistant({content: errorMsg, error: true})
+        }
       }
 
       while (true) {

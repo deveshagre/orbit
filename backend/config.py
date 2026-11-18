@@ -6,6 +6,9 @@ BASE_DIR = Path(__file__).resolve().parent
 # Gemini Provider Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL = os.getenv("ORBIT_MODEL", "gemini-2.5-flash")
+FALLBACK_MODELS = [m.strip() for m in os.getenv("ORBIT_FALLBACK_MODELS", "gemini-2.0-flash,gemini-1.5-flash").split(",") if m.strip()]
+MAX_RETRIES = int(os.getenv("ORBIT_MAX_RETRIES", "3"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("ORBIT_REQUEST_TIMEOUT_SECONDS", "260"))
 
 # Server & Network Configuration
 PORT = int(os.getenv("PORT", os.getenv("ORBIT_PORT", "5100")))

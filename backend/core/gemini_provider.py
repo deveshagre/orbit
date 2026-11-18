@@ -36,7 +36,7 @@ class GeminiProvider:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gemini-3.7-flash",
+        model: str = "gemini-3.5-flash-lite",
         fallback_models: list[str] | None = None,
         client: Any = None,
         max_attempts: int = 2,
@@ -53,7 +53,7 @@ class GeminiProvider:
                 m.strip()
                 for m in os.getenv(
                     "ORBIT_FALLBACK_MODELS",
-                    "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.5-flash",
+                    "gemini-3.8-flash",
                 ).split(",")
                 if m.strip()
             ]

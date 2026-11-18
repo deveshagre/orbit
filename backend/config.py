@@ -7,12 +7,12 @@ BASE_DIR = Path(__file__).resolve().parent
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # These are preferences only. GeminiProvider intersects them with the SDK model
 # inventory and will never call an ID that is not listed as generateContent-capable.
-MODEL = os.getenv("ORBIT_MODEL", "gemini-3.8-flash")
+MODEL = os.getenv("ORBIT_MODEL", "gemini-3.5-flash-lite")
 FALLBACK_MODELS = [
     m.strip()
     for m in os.getenv(
         "ORBIT_FALLBACK_MODELS",
-        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
     ).split(",")
     if m.strip()
 ]

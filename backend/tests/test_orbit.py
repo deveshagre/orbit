@@ -526,7 +526,7 @@ def test_gemini_provider_sanitizes_credentials_in_logs():
 def test_gemini_provider_timeout_budget_terminates_cleanly():
     mock_client = MagicMock()
     mock_client.models.list.return_value = [
-        types.Model(name="models/gemini-3.7-flash", supported_actions=["generateContent"])
+        types.Model(name="models/gemini-3.5-flash-lite", supported_actions=["generateContent"])
     ]
     err_503 = APIError(503, {"error": {"code": 503, "message": "Overloaded", "status": "UNAVAILABLE"}})
     mock_client.models.generate_content_stream.side_effect = err_503

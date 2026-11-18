@@ -1,6 +1,6 @@
 import os
 
-# Port binding: Render injects PORT; fallback to ORBIT_PORT or 5100
+# Port binding: Cloud Run injects PORT (default 8080); fallback to ORBIT_PORT or 5100
 port = os.getenv("PORT", os.getenv("ORBIT_PORT", "5100"))
 bind = f"0.0.0.0:{port}"
 
@@ -13,8 +13,7 @@ worker_class = "gthread"
 timeout = int(os.getenv("GUNICORN_TIMEOUT", "120"))
 keepalive = 5
 
-# Logging: Stream to stdout/stderr for cloud log aggregators (e.g. Render, Datadog)
+# Logging: Stream to stdout/stderr for cloud log aggregators (e.g. Google Cloud Logging)
 accesslog = "-"
 errorlog = "-"
 loglevel = os.getenv("LOG_LEVEL", "info")
-

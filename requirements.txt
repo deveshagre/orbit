@@ -1,0 +1,6 @@
+Flask>=3.0,<4
+google-genai>=1.0.0
+gunicorn>=21.0
+flask-cors>=4.0
+ddgs>=9,<10
+pytest>=8,<9

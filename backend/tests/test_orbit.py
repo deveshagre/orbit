@@ -249,3 +249,46 @@ def test_optional_api_key_protection(monkeypatch):
     r_ok = client.post("/api/chat", json={"message": "Hello"}, headers={"X-API-Key": "secret_token_123"})
     r_ok.get_data()
     assert r_ok.status_code == 200
+
+def test_vercel_function_entrypoint_and_aliases():
+    import sys
+    from pathlib import Path
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    if str(root_dir) not in sys.path:
+        sys.path.insert(0, str(root_dir))
+    import api.index as vercel_entrypoint
+    assert hasattr(vercel_entrypoint, "app")
+    client = vercel_entrypoint.app.test_client()
+    res1 = client.get("/api/health")
+    assert res1.status_code == 200
+    res2 = client.get("/health")
+    assert res2.status_code == 200
+    res3 = client.get("/api/health/")
+    assert res3.status_code == 200
+    # Verify post routes match both prefixes
+    r_chat1 = client.post("/api/chat", json={"message": "ping"})
+    assert r_chat1.status_code in (200, 429)
+    r_chat1.get_data()
+    r_chat2 = client.post("/chat", json={"message": "ping"})
+    assert r_chat2.status_code in (200, 429)
+    r_chat2.get_data()
+
+def test_client_provided_history_stateless():
+    provider = FakeProvider([[GeminiStreamChunk(text="Context acknowledged.")]])
+    agent = Agent(provider, ToolRegistry(), "gemini-2.5-flash")
+    app = create_app(agent=agent)
+    client = app.test_client()
+
+    history_payload = [
+        {"role": "user", "content": "My name is Alice"},
+        {"role": "assistant", "content": "Nice to meet you, Alice."},
+    ]
+    res = client.post("/api/chat", json={
+        "message": "What is my name?",
+        "conversation_id": "test-stateless",
+        "history": history_payload
+    })
+    res.get_data()
+    assert res.status_code == 200
+    passed_history = provider.calls[0]["history"]
+    assert any(m["content"] == "My name is Alice" for m in passed_history)

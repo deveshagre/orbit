@@ -59,11 +59,15 @@ export default function App() {
       return {...c, messages}
     })
 
+    const historyPayload = active.messages
+      .filter(m => m.content && !m.error)
+      .map(m => ({ role: m.role, content: m.content }))
+
     try {
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, conversation_id: id })
+        body: JSON.stringify({ message: text, conversation_id: id, history: historyPayload })
       })
 
       if (!res.ok || !res.body) {

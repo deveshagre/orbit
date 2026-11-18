@@ -36,7 +36,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("orbit")
 
 class SimpleRateLimiter:
-    """Sliding window rate limiter per client IP."""
+    """Sliding window rate limiter per client IP.
+
+    NOTE: In serverless environments (such as Vercel Functions), this in-memory
+    limiter only tracks requests within a single ephemeral function instance.
+    It does not persist across cold starts or distribute across concurrent instances,
+    so it does NOT provide production-grade abuse protection in serverless mode.
+    For production abuse prevention on Vercel, use Vercel WAF / Firewall rules or
+    an external distributed store like Upstash Redis.
+    """
     def __init__(self, max_requests: int = 60, window_seconds: int = 60):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
@@ -64,6 +72,7 @@ class SimpleRateLimiter:
 
 def create_app(agent=None, rate_limiter=None):
     app = Flask(__name__)
+    app.url_map.strict_slashes = False
     app.config["JSON_SORT_KEYS"] = False
     app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_SIZE_BYTES
 
@@ -76,7 +85,7 @@ def create_app(agent=None, rate_limiter=None):
 
     CORS(
         app,
-        resources={r"/api/*": {"origins": cors_origins}},
+        resources={r"/api/*": {"origins": cors_origins}, r"/*": {"origins": cors_origins}},
         methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization", "X-API-Key"],
         supports_credentials=True,
@@ -149,6 +158,7 @@ def create_app(agent=None, rate_limiter=None):
         return None
 
     @app.get("/api/health")
+    @app.get("/health")
     def health():
         has_key = bool(GEMINI_API_KEY) or hasattr(agent, "_fake") or agent is not None
         status = "ready" if has_key else "missing_api_key"
@@ -166,6 +176,7 @@ def create_app(agent=None, rate_limiter=None):
         })
 
     @app.get("/api/metrics")
+    @app.get("/metrics")
     def metrics():
         auth_err = verify_api_protection()
         if auth_err:
@@ -191,6 +202,7 @@ def create_app(agent=None, rate_limiter=None):
         return jsonify({"ok": True, "latency": output})
 
     @app.post("/api/chat")
+    @app.post("/chat")
     def chat():
         auth_err = verify_api_protection()
         if auth_err:
@@ -215,6 +227,7 @@ def create_app(agent=None, rate_limiter=None):
         if not isinstance(conversation_id, str) or len(conversation_id) > 100:
             return jsonify({"ok": False, "error": "Invalid conversation_id"}), 400
         text = message.strip()
+        client_history = body.get("history")
 
         with state_lock:
             # Enforce max conversation limit to prevent memory leak
@@ -223,7 +236,16 @@ def create_app(agent=None, rate_limiter=None):
                 del conversations[oldest_id]
                 conversation_locks.pop(oldest_id, None)
 
-            history = conversations.setdefault(conversation_id, [])
+            if isinstance(client_history, list) and client_history:
+                # Sanitize and adopt client-provided history for serverless statelessness
+                history = [
+                    {"role": m.get("role", "user"), "content": m.get("content", "")}
+                    for m in client_history
+                    if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+                ]
+                conversations[conversation_id] = history
+            else:
+                history = conversations.setdefault(conversation_id, [])
             convo_lock = conversation_locks.setdefault(conversation_id, Lock())
 
         def events():

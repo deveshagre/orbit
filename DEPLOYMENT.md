@@ -1,181 +1,131 @@
-# ORBIT Cloud Deployment Guide
+# ORBIT Vercel Deployment Guide
 
-This guide details the deployment of ORBIT as a decoupled cloud-ready system:
-- **Frontend**: React + Vite + TypeScript deployed on **Vercel**
-- **Backend**: Flask + Google Gemini API + Gunicorn (`gthread` worker) deployed on **Render**
+ORBIT is configured for **single-project, single-domain hosting on Vercel**:
+- **Frontend**: React + Vite + TypeScript served as static assets from `frontend/dist`
+- **Backend**: Python + Flask running as Vercel Serverless Functions from `api/index.py`
+- **AI Engine**: Google Gemini API via official `google-genai` SDK
+- **Domain**: Single public domain (e.g. `https://orbit.vercel.app`) with automatic same-origin API routing
 
 ---
 
 ## Architecture Overview
 
 ```
-                      ┌───────────────────────────────┐
-                      │    Client Browser / User      │
-                      └───────▲───────────────┬───────┘
-                              │               │
-                     Static Assets       SSE Streaming
-                     (HTML/JS/CSS)      /api/chat, /api/health
-                              │               │
-                ┌─────────────┴──────┐ ┌──────▼─────────────────────┐
-                │   Vercel (Frontend)│ │     Render (Backend API)   │
-                │                    │ │                            │
-                │  • React + Vite    │ │  • Flask + Gunicorn        │
-                │  • vercel.json     │ │  • GeminiProvider          │
-                │  • VITE_API_URL    │ │  • ToolRegistry & Search   │
-                └────────────────────┘ │  • CORS, Rate Limiter      │
-                                       └──────────────┬─────────────┘
-                                                      │
-                                             google-genai SDK
-                                             (GEMINI_API_KEY)
-                                                      │
-                                       ┌──────────────▼─────────────┐
-                                       │    Google Gemini API       │
-                                       │   (gemini-2.5-flash)       │
-                                       └────────────────────────────┘
+                      ┌────────────────────────────────────────┐
+                      │        Client Browser / User           │
+                      └───────────────────▲────────────────────┘
+                                          │
+                                 Single Public Domain
+                             (https://orbit.vercel.app)
+                                          │
+                        ┌─────────────────┴──────────────────┐
+                        │      Vercel (Single Project)       │
+                        │                                    │
+                        │  Static Assets & SPA Rewrites      │
+                        │  • /assets/* -> frontend/dist      │
+                        │  • /*        -> index.html         │
+                        │                                    │
+                        │  Serverless Function               │
+                        │  • /api/*    -> api/index.py       │
+                        │     - Python runtime (WSGI/Flask)  │
+                        │     - SSE Streaming (no-transform) │
+                        │     - maxDuration: 300s (Hobby)    │
+                        │     - google-genai SDK             │
+                        └─────────────────┬──────────────────┘
+                                          │
+                                   GEMINI_API_KEY
+                                (Backend Environment)
+                                          │
+                        ┌─────────────────▼──────────────────┐
+                        │        Google Gemini API           │
+                        │       (gemini-2.5-flash)           │
+                        └────────────────────────────────────┘
 ```
 
-### Key Cloud Features & Guarantees
-1. **API Key Security**: `GEMINI_API_KEY` is loaded strictly by the backend environment. It is **never** bundled or exposed to the browser.
-2. **Streaming Support**: Gunicorn is configured with the `gthread` worker class and extended timeouts (120s) to support Server-Sent Events (SSE).
-3. **CORS Isolation**: The backend restricts cross-origin calls to the approved frontend origin (`ALLOWED_ORIGINS`).
-4. **Local Tools Safeguards**: Desktop app launching and Mac filesystem access are disabled by default with explanatory feedback if invoked. Web search (`ddgs`) remains fully operational.
-5. **DDoS & Abuse Protection**: Includes an in-memory sliding-window IP rate limiter (default: 60 req/min), 1 MB payload limits, and optional `ORBIT_API_KEY` authentication.
+---
+
+## 1. Exact Vercel Dashboard Settings
+
+When importing the repository into the [Vercel Dashboard](https://vercel.com/dashboard):
+
+### Project Configuration
+| Setting | Exact Value | Notes |
+| :--- | :--- | :--- |
+| **Project Name** | `orbit` | Or any preferred name |
+| **Framework Preset** | `Vite` (or `Other`) | Vercel detects Vite or uses `vercel.json` |
+| **Root Directory** | `./` (Leave as default `.`) | **Do not select `frontend`**. Must remain at repository root so Vercel discovers both `frontend/` and `api/`. |
+| **Build Command** | `npm run build` | Defined in root `package.json` (`npm --prefix frontend install && npm --prefix frontend run build`) |
+| **Output Directory** | `frontend/dist` | Pre-configured in `vercel.json` |
+| **Install Command** | `npm install` | Installs root orchestrator script |
 
 ---
 
-## 1. Backend Deployment on Render
+### Environment Variables
+Under **Project Settings > Environment Variables** in Vercel:
 
-### Step 1: Create a Render Web Service
-1. Log in to your [Render Dashboard](https://dashboard.render.com/).
-2. Click **New +** and select **Web Service**.
-3. Connect your GitHub repository containing the ORBIT project.
-
-### Step 2: Configure Service Settings
-| Field | Value | Notes |
+| Key | Recommended Value | Description |
 | :--- | :--- | :--- |
-| **Name** | `orbit-backend` | Or any unique name |
-| **Region** | Oregon (US West) or closest region | Select region near users |
-| **Branch** | `main` | Production branch |
-| **Root Directory** | `backend` | **Important**: Set to `backend` |
-| **Runtime** | `Python 3` | |
-| **Build Command** | `pip install -r requirements.txt` | Installs Flask, google-genai, gunicorn, etc. |
-| **Start Command** | `gunicorn -c gunicorn.conf.py app:app` | Uses production configuration |
-| **Instance Type** | Free or Starter | 512 MB+ recommended |
-
-### Step 3: Add Backend Environment Variables
-In the Render dashboard under **Environment**:
-
-| Key | Example Value | Description |
-| :--- | :--- | :--- |
-| `GEMINI_API_KEY` | `AIzaSy...` | **Required**. Your Google Gemini API Key |
-| `ALLOWED_ORIGINS` | `https://orbit-app.vercel.app` | **Required**. Your Vercel frontend URL (use `*` for initial setup) |
-| `ORBIT_MODEL` | `gemini-2.5-flash` | Gemini model (options: `gemini-2.5-flash`, `gemini-2.0-flash`) |
-| `PYTHON_VERSION` | `3.11.9` | Ensures stable runtime dependencies |
-| `ORBIT_ENABLE_APP_LAUNCHER` | `false` | Disables macOS app launcher in cloud |
-| `ORBIT_ENABLE_LOCAL_FILESYSTEM` | `false` | Disables local Mac filesystem access |
-| `ORBIT_RATE_LIMIT_PER_MINUTE` | `60` | Max requests per client IP per minute |
-| `ORBIT_API_KEY` | *(optional)* | Secret token to require on API requests |
-
-### Step 4: Configure Health Check Path
-Under **Advanced**:
-- **Health Check Path**: `/api/health`
-
-### Step 5: Deploy & Note Backend URL
-Click **Create Web Service**. Once deployed, Render will assign a public URL:
-`https://orbit-backend.onrender.com`
-
----
-
-## 2. Frontend Deployment on Vercel
-
-### Step 1: Import Project into Vercel
-1. Log in to [Vercel Dashboard](https://vercel.com/dashboard).
-2. Click **Add New...** > **Project**.
-3. Select your GitHub repository.
-
-### Step 2: Configure Build & Output Settings
-| Field | Value |
-| :--- | :--- |
-| **Framework Preset** | `Vite` |
-| **Root Directory** | Click *Edit* and select `frontend` |
-| **Build Command** | `npm run build` |
-| **Output Directory** | `dist` |
-| **Install Command** | `npm install` |
-
-### Step 3: Set Frontend Environment Variables
-In the Vercel project configuration under **Environment Variables**:
-
-| Key | Value | Description |
-| :--- | :--- | :--- |
-| `VITE_API_URL` | `https://orbit-backend.onrender.com` | **Required**. Your live Render backend URL (no trailing slash) |
+| `GEMINI_API_KEY` | `AIzaSy...` | **Required**. Your Google Gemini API Key from [Google AI Studio](https://aistudio.google.com/). |
+| `ORBIT_MODEL` | `gemini-2.5-flash` | Gemini model variant (optional, defaults to `gemini-2.5-flash`). |
+| `VITE_API_URL` | *(Leave empty)* | **Leave empty or unset**. When empty, the frontend calls `/api/*` on the same domain, eliminating CORS preflight. |
+| `ALLOWED_ORIGINS` | `*` | Optional CORS header fallback. |
+| `ORBIT_ENABLE_APP_LAUNCHER` | `false` | Disables macOS app launcher in cloud. |
+| `ORBIT_ENABLE_LOCAL_FILESYSTEM` | `false` | Disables local Mac filesystem access. |
 
 > [!IMPORTANT]
-> Never set `GEMINI_API_KEY` in Vercel or any `VITE_*` variable. Only the backend communicates with the Gemini API.
-
-### Step 4: Deploy & Finalize CORS
-1. Click **Deploy**.
-2. Once deployed, Vercel gives you your frontend URL (e.g., `https://orbit-app.vercel.app`).
-3. Return to the **Render Dashboard** for `orbit-backend` and ensure `ALLOWED_ORIGINS` contains your Vercel domain:
-   ```env
-   ALLOWED_ORIGINS=https://orbit-app.vercel.app
-   ```
+> `GEMINI_API_KEY` is loaded exclusively inside the serverless Python environment (`api/index.py`). It is never bundled into static assets or exposed to the browser.
 
 ---
 
-## 3. Local Verification Before Deploying
+## 2. Serverless Function Specifications
 
-You can verify the cloud architecture locally before deploying to the public web:
+- **Entrypoint**: [`api/index.py`](file:///Users/devesh/Developer/orbit/api/index.py) exports the WSGI `app` callable from `backend/app.py`.
+- **Dependencies**: Root [`requirements.txt`](file:///Users/devesh/Developer/orbit/requirements.txt), [`api/requirements.txt`](file:///Users/devesh/Developer/orbit/api/requirements.txt), and [`backend/requirements.txt`](file:///Users/devesh/Developer/orbit/backend/requirements.txt) are self-contained and identical, avoiding relative path resolution failures during Vercel's isolated container builds.
+- **Max Duration**: Configured to `300` seconds in [`vercel.json`](file:///Users/devesh/Developer/orbit/vercel.json) (supported on Vercel Fluid Compute).
+- **File Bundling**: [`vercel.json`](file:///Users/devesh/Developer/orbit/vercel.json) targets `"includeFiles": "backend/{*.py,core/**/*.py,tools/**/*.py}"` and explicitly excludes `.venv`, `__pycache__`, `.pytest_cache`, and `tests` via `"excludeFiles": "backend/{.venv/**,__pycache__/**,.pytest_cache/**,tests/**}"` to ensure lean lambda bundle sizes.
+- **SSE Streaming**: Responses return `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`, allowing Server-Sent Events to stream tokens and live tool activity directly to the browser.
+- **Routing Isolation**: [`vercel.json`](file:///Users/devesh/Developer/orbit/vercel.json) routes all `/api/(.*)` requests to `api/index.py` before applying the SPA fallback `/((?!api/).*)` to `index.html`. This ensures the single-page application never intercepts API calls.
 
-### Terminal 1: Backend with Gunicorn
+---
+
+## 3. Serverless State & Rate Limiting Behavior
+
+1. **Stateless Multi-Turn Context**:
+   Serverless functions are ephemeral and may be cold-started or routed to different instances across requests. ORBIT preserves conversation context by having the client provide previous conversation turns (`history`) in the request payload. The backend sanitizes and injects this history into the Gemini context window, ensuring coherent multi-turn reasoning without requiring a persistent database or local disk state.
+
+2. **In-Memory Rate Limiting Disclaimer**:
+   The backend includes an in-memory sliding-window limiter (`SimpleRateLimiter`). In a serverless environment like Vercel, this in-memory counter is scoped only to a single warm function instance and does not persist across cold starts or distribute across concurrent containers. **It does not provide production-grade abuse or DDoS protection.** For production abuse prevention, enable Vercel Attack Challenge Mode / WAF rules in the Vercel dashboard.
+
+3. **Guarded Local Tools**:
+   Opening desktop applications (`open -a`) and accessing the Mac filesystem are disabled. If a prompt triggers these actions, the agent returns an informative message explaining that the tool is unavailable in cloud/serverless hosting. Live web search via DuckDuckGo (`ddgs`) remains fully operational.
+
+---
+
+## 4. Local Development & Verification
+
+### Running Locally
 ```bash
+# Terminal 1: Backend
 cd backend
 source .venv/bin/activate
-export GEMINI_API_KEY="your_api_key_here"  # Or add to backend/.env
-export ALLOWED_ORIGINS="http://localhost:5173"
-gunicorn -c gunicorn.conf.py app:app
-```
+export GEMINI_API_KEY="your_api_key_here"
+python app.py
 
-Verify backend health:
-```bash
-curl -i http://localhost:5100/api/health
-```
-
-### Terminal 2: Frontend with Vite
-```bash
+# Terminal 2: Frontend
 cd frontend
-export VITE_API_URL="http://127.0.0.1:5100"
 npm run dev
 ```
 
-Open `http://localhost:5173` in your browser. The header should display **Gemini 2.5 Flash**, the status pill should show **API ready**, and web searches will query through DuckDuckGo without any dependency on Ollama or local Mac files.
+### Running Automated Tests
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest -v
+```
 
----
-
-## 4. Environment Variables Reference
-
-### Backend (`backend/.env` / Render)
-| Variable | Default | Purpose |
-| :--- | :--- | :--- |
-| `GEMINI_API_KEY` | *(None)* | **Required**. Authentication key for Google Gemini API |
-| `ORBIT_MODEL` | `gemini-2.5-flash` | Gemini model variant |
-| `PORT` | `5100` | HTTP port (Render injects this dynamically) |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated list of allowed frontend origins |
-| `ORBIT_API_KEY` | *(None)* | Optional token for basic API header protection |
-| `ORBIT_RATE_LIMIT_PER_MINUTE` | `60` | Client IP sliding-window rate limit |
-| `ORBIT_MAX_REQUEST_SIZE_BYTES` | `1048576` | Maximum JSON request size (1 MB) |
-| `ORBIT_MAX_MESSAGE_LENGTH` | `8000` | Max characters per user prompt |
-| `ORBIT_MAX_TOOL_ROUNDS` | `5` | Maximum agent function-calling rounds |
-| `ORBIT_CONTEXT_MESSAGES` | `8` | Number of previous conversation turns preserved |
-| `ORBIT_MAX_OUTPUT_TOKENS` | `1024` | Token limit for LLM responses |
-| `ORBIT_TEMPERATURE` | `0.2` | Generation temperature |
-| `ORBIT_ENABLE_APP_LAUNCHER` | `false` | Enable/disable macOS app launcher |
-| `ORBIT_ENABLE_LOCAL_FILESYSTEM` | `false` | Enable/disable workspace filesystem tool |
-| `WEB_CONCURRENCY` | `2` | Gunicorn worker process count |
-| `GUNICORN_THREADS` | `4` | Gunicorn threads per worker |
-| `GUNICORN_TIMEOUT` | `120` | Request timeout for long agent streaming |
-
-### Frontend (`frontend/.env` / Vercel)
-| Variable | Default | Purpose |
-| :--- | :--- | :--- |
-| `VITE_API_URL` | `""` | Base URL of deployed backend. If omitted, uses Vite proxy. |
-
+### Building the Production Frontend
+From project root:
+```bash
+npm run build
+```
+This runs `npm --prefix frontend install && npm --prefix frontend run build` and outputs the build to `frontend/dist/`.
